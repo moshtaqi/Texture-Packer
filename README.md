@@ -56,17 +56,34 @@ It supports single-material setup, batch conversion, drag-and-drop map assignmen
 - Emissive
 - Detail Mask
 
-## Install
+## Install For Windows
 
-Python 3.12+ is recommended.
+Download the latest Windows executable from the [GitHub Releases page](https://github.com/moshtaqi/Texture-Packer/releases).
+
+For v1, download:
+
+```text
+MaterialTextureStudio-v1.exe
+```
+
+The `.exe` is self-contained and includes the Python runtime, PyQt6, Pillow, NumPy, the bundled Comfortaa font, and the app icon.
+
+## Usage
+
+1. Run `MaterialTextureStudio-v1.exe`.
+2. Choose a source folder and output folder.
+3. Pick an export preset from the top-right preset selector.
+4. Use **Auto Map** to detect textures, or assign texture slots manually with **Browse** or drag-and-drop.
+5. Check **Material Health** for missing maps, texture resolution, and warnings.
+6. Click **Export Selected**, **Export All**, or use **Batch Conversion** for nested folders.
+7. Use **Open Output** after export to jump to the generated textures.
+
+## Run From Source
+
+Python 3.12+ is recommended for development.
 
 ```powershell
 python -m pip install -r requirements.txt
-```
-
-## Run
-
-```powershell
 python -m material_texture_studio
 ```
 
@@ -112,5 +129,5 @@ The app uses a bundled Comfortaa font and `texture_packer_icon.ico` for the wind
 For PyInstaller, start with:
 
 ```powershell
-pyinstaller --noconsole --name "Material Texture Studio" --icon texture_packer_icon.ico --add-data "material_texture_studio/assets/fonts/Comfortaa.ttf;material_texture_studio/assets/fonts" --add-data "texture_packer_icon.ico;." run_material_texture_studio.py
+python -m PyInstaller --clean --noconfirm --onefile --windowed --name MaterialTextureStudio-v1 --icon texture_packer_icon.ico --add-data "material_texture_studio/assets/fonts/Comfortaa.ttf;material_texture_studio/assets/fonts" --add-data "texture_packer_icon.ico;." run_material_texture_studio.py
 ```
