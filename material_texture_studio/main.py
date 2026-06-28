@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import sys
+from dataclasses import replace
+from io import BytesIO
 from pathlib import Path
 
 from PyQt6.QtCore import QDateTime, QRectF, QSize, QStandardPaths, Qt, QUrl, pyqtSignal
@@ -28,6 +30,7 @@ from PyQt6.QtWidgets import (
     QStackedWidget,
     QTableWidget,
     QTableWidgetItem,
+    QTabWidget,
     QTextEdit,
     QVBoxLayout,
     QWidget,
@@ -39,8 +42,8 @@ from material_texture_studio.detect import (
     detect_material_sets_by_folder,
     is_image_file,
 )
-from material_texture_studio.models import ChannelSource, MaterialSet, Preset
-from material_texture_studio.packer import pack_material, validate_material
+from material_texture_studio.models import ChannelSource, MaterialSet, OutputTexture, Preset
+from material_texture_studio.packer import pack_material, resolve_channel, validate_material
 from material_texture_studio.presets import MAP_TYPES, PRESETS, ordered_map_types_for_preset
 from material_texture_studio.preview import make_thumbnail
 
@@ -61,6 +64,43 @@ WARNING = "#F0B85A"
 RADIUS = 10
 FONT_PATH = Path(__file__).parent / "assets" / "fonts" / "Comfortaa.ttf"
 APP_ICON_PATH = Path(__file__).resolve().parents[1] / "texture_packer_icon.ico"
+
+COMPRESSION_PROFILES = {
+    "desktop_bc": {
+        "name": "Desktop / Console BC",
+        "texture_formats": "BaseColor: BC7 or BC1, Normal: BC5, Masks: BC4/BC7",
+        "notes": (
+            "Best for Unreal, Unity, and Godot desktop targets.",
+            "Generate mipmaps in-engine unless your runtime pipeline expects prebuilt DDS.",
+        ),
+    },
+    "mobile_astc": {
+        "name": "Mobile ASTC",
+        "texture_formats": "ASTC 6x6 or 8x8, Normal: ASTC normal-quality profile",
+        "notes": (
+            "Good default for modern Android/iOS projects.",
+            "Keep critical hero materials at 4x4 or 6x6 if memory allows.",
+        ),
+    },
+    "android_etc2": {
+        "name": "Android ETC2",
+        "texture_formats": "ETC2 RGB/RGBA, Normal: engine normal import profile",
+        "notes": (
+            "Fallback-friendly Android profile.",
+            "Watch alpha usage; RGBA ETC2 costs more than RGB.",
+        ),
+    },
+    "web_ktx2": {
+        "name": "Web / KTX2 Basis",
+        "texture_formats": "KTX2/Basis Universal, transcoded by engine/runtime",
+        "notes": (
+            "Useful for WebGL/WebGPU and multi-platform glTF pipelines.",
+            "Export PNG masters here, then compress to KTX2 in your build pipeline.",
+        ),
+    },
+}
+
+CUSTOM_PRESET_ID = "custom_mask"
 
 
 def load_app_font(app: QApplication | None) -> None:
@@ -600,6 +640,10 @@ class MaterialTextureStudio(QMainWindow):
             return
 
         preset_id = data.get("preset")
+        custom_preset = data.get("custom_preset")
+        if custom_preset and hasattr(self, "custom_suffix_edit"):
+            self._set_custom_config(custom_preset)
+            self._apply_custom_preset_config(select=False)
         if preset_id in PRESETS:
             index = self.preset_combo.findData(preset_id)
             if index >= 0:
@@ -630,7 +674,21 @@ class MaterialTextureStudio(QMainWindow):
             if key in options:
                 checkbox.setChecked(bool(options[key]))
 
-        self._set_page(int(data.get("mode", 0)) if data.get("mode") in {0, 1} else 0)
+        if "smoothness_mode" in options and hasattr(self, "smoothness_mode_combo"):
+            index = self.smoothness_mode_combo.findData(options["smoothness_mode"])
+            if index >= 0:
+                self.smoothness_mode_combo.setCurrentIndex(index)
+        if "compression_profile" in options and hasattr(self, "compression_profile_combo"):
+            index = self.compression_profile_combo.findData(options["compression_profile"])
+            if index >= 0:
+                self.compression_profile_combo.setCurrentIndex(index)
+        if "pot_warning" in options and hasattr(self, "pot_warning_check"):
+            self.pot_warning_check.setChecked(bool(options["pot_warning"]))
+        if "manifest_profile" in options and hasattr(self, "manifest_profile_check"):
+            self.manifest_profile_check.setChecked(bool(options["manifest_profile"]))
+
+        mode = data.get("mode", 0)
+        self._set_page(int(mode) if mode in {0, 1, 2} else 0)
 
     def _save_settings(self) -> None:
         path = settings_path()
@@ -650,7 +708,12 @@ class MaterialTextureStudio(QMainWindow):
                 "batch_folder_per_material": self.batch_folder_per_material_check.isChecked(),
                 "batch_overwrite": self.batch_overwrite_check.isChecked(),
                 "batch_skip_incomplete": self.batch_skip_bad_check.isChecked(),
+                "smoothness_mode": self.smoothness_mode_combo.currentData(),
+                "compression_profile": self.compression_profile_combo.currentData(),
+                "pot_warning": self.pot_warning_check.isChecked(),
+                "manifest_profile": self.manifest_profile_check.isChecked(),
             },
+            "custom_preset": self._custom_config_from_ui(),
         }
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -680,6 +743,7 @@ class MaterialTextureStudio(QMainWindow):
         self.pages = QStackedWidget()
         self.pages.addWidget(self._build_single_page())
         self.pages.addWidget(self._build_batch_page())
+        self.pages.addWidget(self._build_advanced_page())
         body.addWidget(self.pages, 1)
         root.addLayout(body, 1)
 
@@ -729,11 +793,14 @@ class MaterialTextureStudio(QMainWindow):
 
         self.single_nav = NavButton("Single Material")
         self.batch_nav = NavButton("Batch Conversion")
+        self.advanced_nav = NavButton("Advanced Tools")
         self.single_nav.clicked.connect(lambda: self._set_page(0))
         self.batch_nav.clicked.connect(lambda: self._set_page(1))
+        self.advanced_nav.clicked.connect(lambda: self._set_page(2))
         self.single_nav.setChecked(True)
         layout.addWidget(self.single_nav)
         layout.addWidget(self.batch_nav)
+        layout.addWidget(self.advanced_nav)
         layout.addSpacing(10)
 
         layout.addWidget(make_label("Current Preset", "TinyHeader"))
@@ -1013,16 +1080,523 @@ class MaterialTextureStudio(QMainWindow):
         root.addWidget(actions)
         return page
 
+    def _build_advanced_page(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        tabs = QTabWidget()
+        tabs.setObjectName("AdvancedTabs")
+        tabs.addTab(self._build_preset_tab(), "Presets")
+        tabs.addTab(self._build_inspector_tab(), "Channel Inspector")
+        tabs.addTab(self._build_game_ready_tab(), "Game-Ready Export")
+        layout.addWidget(tabs)
+        return page
+
+    def _build_preset_tab(self) -> QWidget:
+        page = QWidget()
+        root = QHBoxLayout(page)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(12)
+
+        details = Panel("Panel")
+        details_layout = QVBoxLayout(details)
+        details_layout.setContentsMargins(14, 14, 14, 14)
+        details_layout.setSpacing(12)
+        details_layout.addWidget(make_label("Preset Details", "PanelTitle"))
+        self.preset_engine_label = make_label("Engine: n/a", "HealthText")
+        self.preset_outputs_label = make_label("Outputs: n/a", "HealthText")
+        self.preset_channels_label = make_label("Channels: n/a", "HealthText")
+        self.preset_notes_label = make_label("Import notes appear here.", "HealthText")
+        self.preset_notes_label.setWordWrap(True)
+        for widget in (
+            self.preset_engine_label,
+            self.preset_outputs_label,
+            self.preset_channels_label,
+            self.preset_notes_label,
+        ):
+            widget.setWordWrap(True)
+            details_layout.addWidget(widget)
+
+        details_layout.addSpacing(8)
+        details_layout.addWidget(make_label("Roughness / Smoothness", "PanelTitle"))
+        self.smoothness_mode_combo = QComboBox()
+        self.smoothness_mode_combo.addItem("Auto: smoothness, else inverted roughness", "auto")
+        self.smoothness_mode_combo.addItem("Force inverted roughness when available", "force_roughness")
+        self.smoothness_mode_combo.addItem("Prefer smoothness map only", "prefer_smoothness")
+        self.smoothness_mode_combo.currentIndexChanged.connect(self._advanced_options_changed)
+        details_layout.addWidget(self.smoothness_mode_combo)
+        hint = make_label(
+            "Unity-style smoothness channels can be generated from roughness by inverting values.",
+            "HealthText",
+        )
+        hint.setWordWrap(True)
+        details_layout.addWidget(hint)
+        details_layout.addStretch(1)
+        root.addWidget(details, 1)
+
+        builder = Panel("Panel")
+        builder_layout = QVBoxLayout(builder)
+        builder_layout.setContentsMargins(14, 14, 14, 14)
+        builder_layout.setSpacing(12)
+        builder_layout.addWidget(make_label("Custom Mask Builder", "PanelTitle"))
+        builder_hint = make_label(
+            "Build a project-specific RGBA mask, then select it from the Export Preset dropdown.",
+            "HealthText",
+        )
+        builder_hint.setWordWrap(True)
+        builder_layout.addWidget(builder_hint)
+
+        self.custom_suffix_edit = QLineEdit("_CustomMask")
+        self.custom_suffix_edit.setObjectName("PathEdit")
+        self.custom_suffix_edit.setToolTip("Suffix used for the generated custom mask output.")
+        builder_layout.addWidget(make_label("Output Suffix", "FieldLabel"))
+        builder_layout.addWidget(self.custom_suffix_edit)
+
+        self.custom_channel_combos: dict[str, QComboBox] = {}
+        self.custom_channel_inverts: dict[str, TickCheckBox] = {}
+        grid = QGridLayout()
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setHorizontalSpacing(10)
+        grid.setVerticalSpacing(8)
+        channel_options = [
+            ("Constant 0", "constant:0"),
+            ("Constant 128", "constant:128"),
+            ("Constant 255", "constant:255"),
+        ] + [
+            (info.label.split(" / ", 1)[0], f"map:{key}")
+            for key, info in MAP_TYPES.items()
+            if key != "emissive"
+        ]
+        defaults = {"r": "map:ao", "g": "map:roughness", "b": "map:metallic", "a": "constant:255"}
+        for row, channel in enumerate(("r", "g", "b", "a")):
+            grid.addWidget(make_label(channel.upper(), "FieldLabel"), row, 0)
+            combo = QComboBox()
+            combo.setObjectName("CustomChannelCombo")
+            for label, value in channel_options:
+                combo.addItem(label, value)
+            combo.setCurrentIndex(max(0, combo.findData(defaults[channel])))
+            invert = TickCheckBox("Invert")
+            invert.setMinimumWidth(86)
+            invert.setToolTip(f"Invert the {channel.upper()} channel values before packing.")
+            self.custom_channel_combos[channel] = combo
+            self.custom_channel_inverts[channel] = invert
+            grid.addWidget(combo, row, 1)
+            grid.addWidget(invert, row, 2)
+        builder_layout.addLayout(grid)
+
+        self.apply_custom_preset_button = QPushButton("Use Custom Preset")
+        self.apply_custom_preset_button.setObjectName("PrimaryButton")
+        self.apply_custom_preset_button.clicked.connect(lambda: self._apply_custom_preset_config(select=True))
+        builder_layout.addWidget(self.apply_custom_preset_button, alignment=Qt.AlignmentFlag.AlignRight)
+        builder_layout.addStretch(1)
+        root.addWidget(builder, 1)
+        return page
+
+    def _build_inspector_tab(self) -> QWidget:
+        page = QWidget()
+        root = QHBoxLayout(page)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(12)
+
+        controls = Panel("Panel")
+        controls_layout = QVBoxLayout(controls)
+        controls_layout.setContentsMargins(14, 14, 14, 14)
+        controls_layout.setSpacing(12)
+        controls_layout.addWidget(make_label("Channel Inspector", "PanelTitle"))
+        note = make_label("Preview the exact source feeding each output channel before exporting.", "HealthText")
+        note.setWordWrap(True)
+        controls_layout.addWidget(note)
+        self.inspector_material_label = make_label("Material: none", "HealthText")
+        controls_layout.addWidget(self.inspector_material_label)
+        controls_layout.addWidget(make_label("Output Texture", "FieldLabel"))
+        self.inspector_output_combo = QComboBox()
+        self.inspector_output_combo.currentIndexChanged.connect(self._refresh_inspector)
+        controls_layout.addWidget(self.inspector_output_combo)
+        controls_layout.addWidget(make_label("Channel", "FieldLabel"))
+        self.inspector_channel_combo = QComboBox()
+        for label, value in (("Red", "r"), ("Green", "g"), ("Blue", "b"), ("Alpha", "a"), ("Luma", "l")):
+            self.inspector_channel_combo.addItem(label, value)
+        self.inspector_channel_combo.currentIndexChanged.connect(self._refresh_inspector)
+        controls_layout.addWidget(self.inspector_channel_combo)
+        refresh = QPushButton("Refresh Preview")
+        refresh.setObjectName("SecondaryButton")
+        refresh.clicked.connect(self._refresh_inspector)
+        controls_layout.addWidget(refresh, alignment=Qt.AlignmentFlag.AlignRight)
+        self.inspector_source_label = make_label("Source: n/a", "HealthText")
+        self.inspector_source_label.setWordWrap(True)
+        controls_layout.addWidget(self.inspector_source_label)
+        self.inspector_warning_label = make_label("", "HealthWarning")
+        self.inspector_warning_label.setWordWrap(True)
+        controls_layout.addWidget(self.inspector_warning_label)
+        controls_layout.addStretch(1)
+        root.addWidget(controls, 1)
+
+        preview_panel = Panel("Panel")
+        preview_layout = QVBoxLayout(preview_panel)
+        preview_layout.setContentsMargins(14, 14, 14, 14)
+        preview_layout.setSpacing(12)
+        preview_layout.addWidget(make_label("Grayscale Channel Preview", "PanelTitle"))
+        self.inspector_preview = QLabel("Select a material and channel")
+        self.inspector_preview.setObjectName("InspectorPreview")
+        self.inspector_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.inspector_preview.setMinimumSize(320, 320)
+        preview_layout.addWidget(self.inspector_preview, 1)
+        root.addWidget(preview_panel, 1)
+        return page
+
+    def _build_game_ready_tab(self) -> QWidget:
+        page = QWidget()
+        root = QHBoxLayout(page)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(12)
+
+        controls = Panel("Panel")
+        controls_layout = QVBoxLayout(controls)
+        controls_layout.setContentsMargins(14, 14, 14, 14)
+        controls_layout.setSpacing(12)
+        controls_layout.addWidget(make_label("Game-Ready Export", "PanelTitle"))
+        hint = make_label(
+            "Exports stay as clean PNG masters, with a manifest profile for engine compression choices.",
+            "HealthText",
+        )
+        hint.setWordWrap(True)
+        controls_layout.addWidget(hint)
+        controls_layout.addWidget(make_label("Compression Profile", "FieldLabel"))
+        self.compression_profile_combo = QComboBox()
+        for key, profile in COMPRESSION_PROFILES.items():
+            self.compression_profile_combo.addItem(profile["name"], key)
+        self.compression_profile_combo.currentIndexChanged.connect(self._advanced_options_changed)
+        controls_layout.addWidget(self.compression_profile_combo)
+        self.pot_warning_check = TickCheckBox("Warn non-power-of-two")
+        self.pot_warning_check.setChecked(True)
+        self.pot_warning_check.setToolTip("Flag textures whose dimensions are not powers of two.")
+        self.pot_warning_check.stateChanged.connect(self._refresh_game_ready_panel)
+        self.manifest_profile_check = TickCheckBox("Write profile to manifest")
+        self.manifest_profile_check.setChecked(True)
+        self.manifest_profile_check.setToolTip("Store compression recommendations in each exported manifest JSON.")
+        controls_layout.addWidget(self.pot_warning_check)
+        controls_layout.addWidget(self.manifest_profile_check)
+        controls_layout.addStretch(1)
+        root.addWidget(controls, 1)
+
+        report = Panel("Panel")
+        report_layout = QVBoxLayout(report)
+        report_layout.setContentsMargins(14, 14, 14, 14)
+        report_layout.setSpacing(12)
+        report_layout.addWidget(make_label("Profile Recommendations", "PanelTitle"))
+        self.compression_report = make_label("", "HealthText")
+        self.compression_report.setWordWrap(True)
+        report_layout.addWidget(self.compression_report)
+        self.compression_warnings = make_label("", "HealthWarning")
+        self.compression_warnings.setWordWrap(True)
+        report_layout.addWidget(self.compression_warnings)
+        report_layout.addStretch(1)
+        root.addWidget(report, 1)
+        return page
+
     def _set_page(self, index: int) -> None:
         self.pages.setCurrentIndex(index)
         self.single_nav.setChecked(index == 0)
         self.batch_nav.setChecked(index == 1)
+        self.advanced_nav.setChecked(index == 2)
+
+    def _advanced_options_changed(self) -> None:
+        self._rebuild_slots()
+        if self.current_material:
+            self._load_material_into_slots(self.current_material)
+        self.refresh_batch_table()
+        self._refresh_preset_details()
+        self._update_inspector_output_options()
+        self._refresh_game_ready_panel()
+        self._refresh_actions()
+
+    def _effective_preset(self) -> Preset:
+        preset = self.preset
+        if not hasattr(self, "smoothness_mode_combo"):
+            return preset
+        mode = self.smoothness_mode_combo.currentData()
+        if mode == "auto":
+            return preset
+
+        outputs = []
+        for output in preset.outputs:
+            channels = {
+                name: self._smoothness_adjusted_source(source, mode)
+                for name, source in output.channels.items()
+            }
+            outputs.append(replace(output, channels=channels))
+        return replace(preset, outputs=tuple(outputs))
+
+    def _smoothness_adjusted_source(self, source: ChannelSource, mode: str) -> ChannelSource:
+        fallback = self._smoothness_adjusted_source(source.fallback, mode) if source.fallback else None
+        if mode == "force_roughness" and source.kind == "map" and source.map_type == "smoothness":
+            return ChannelSource.map("roughness", source.channel, invert=True, fallback=fallback or source)
+        if mode == "prefer_smoothness" and source.kind == "map" and source.map_type == "roughness" and source.invert:
+            return ChannelSource.constant(128)
+        if fallback is not source.fallback:
+            return replace(source, fallback=fallback)
+        return source
+
+    def _custom_source_from_combo(self, channel: str) -> ChannelSource:
+        combo = self.custom_channel_combos[channel]
+        value = combo.currentData()
+        invert = self.custom_channel_inverts[channel].isChecked()
+        if str(value).startswith("constant:"):
+            return ChannelSource.constant(int(str(value).split(":", 1)[1]), invert=invert)
+        return ChannelSource.map(str(value).split(":", 1)[1], "gray", invert=invert)
+
+    def _custom_config_from_ui(self) -> dict:
+        return {
+            "suffix": self.custom_suffix_edit.text().strip() or "_CustomMask",
+            "channels": {
+                channel: {
+                    "source": self.custom_channel_combos[channel].currentData(),
+                    "invert": self.custom_channel_inverts[channel].isChecked(),
+                }
+                for channel in ("r", "g", "b", "a")
+            },
+        }
+
+    def _set_custom_config(self, config: dict) -> None:
+        self.custom_suffix_edit.setText(config.get("suffix") or "_CustomMask")
+        channels = config.get("channels", {})
+        for channel, data in channels.items():
+            if channel not in self.custom_channel_combos:
+                continue
+            combo = self.custom_channel_combos[channel]
+            index = combo.findData(data.get("source"))
+            if index >= 0:
+                combo.setCurrentIndex(index)
+            self.custom_channel_inverts[channel].setChecked(bool(data.get("invert")))
+
+    def _apply_custom_preset_config(self, *, select: bool) -> None:
+        config = self._custom_config_from_ui()
+        suffix = config["suffix"]
+        if not suffix.startswith("_"):
+            suffix = "_" + suffix
+            self.custom_suffix_edit.setText(suffix)
+
+        output = OutputTexture(
+            key="custom_mask",
+            label="Custom Mask",
+            suffix=suffix,
+            mode="RGBA",
+            color_space="Linear",
+            channels={channel: self._custom_source_from_combo(channel) for channel in ("r", "g", "b", "a")},
+            description="Project-specific packed mask texture. Check each channel before engine import.",
+        )
+        PRESETS[CUSTOM_PRESET_ID] = Preset(
+            id=CUSTOM_PRESET_ID,
+            name="Custom RGBA Mask",
+            engine="Custom",
+            description=self._custom_preset_description(output),
+            normal_y="unchanged",
+            outputs=(output,),
+            notes=("Custom masks are data textures; usually disable sRGB in-engine.",),
+        )
+
+        index = self.preset_combo.findData(CUSTOM_PRESET_ID)
+        if index < 0:
+            self.preset_combo.addItem(PRESETS[CUSTOM_PRESET_ID].name, CUSTOM_PRESET_ID)
+            index = self.preset_combo.findData(CUSTOM_PRESET_ID)
+        if select and index >= 0:
+            self.preset_combo.setCurrentIndex(index)
+        else:
+            self._preset_changed()
+        self.status.append("Custom RGBA mask preset updated.", status=False)
+
+    def _custom_preset_description(self, output: OutputTexture) -> str:
+        parts = []
+        for channel in ("r", "g", "b", "a"):
+            parts.append(f"{channel.upper()}={self._channel_source_summary(output.channels[channel])}")
+        return "Exports one custom RGBA mask: " + ", ".join(parts) + "."
+
+    def _channel_source_summary(self, source: ChannelSource) -> str:
+        if source.kind == "constant":
+            text = str(source.value)
+        else:
+            info = MAP_TYPES.get(source.map_type or "")
+            text = info.label.split(" / ", 1)[0] if info else (source.map_type or "map")
+        return f"invert {text}" if source.invert else text
+
+    def _source_chain_summary(self, source: ChannelSource) -> str:
+        text = self._channel_source_summary(source)
+        if source.fallback:
+            text += " -> fallback " + self._source_chain_summary(source.fallback)
+        return text
+
+    def _refresh_preset_details(self) -> None:
+        if not hasattr(self, "preset_engine_label"):
+            return
+        preset = self._effective_preset()
+        self.preset_engine_label.setText(f"Engine: {preset.engine}")
+        self.preset_outputs_label.setText(
+            "Outputs: " + ", ".join(f"{output.label} ({output.suffix})" for output in preset.outputs)
+        )
+        channel_lines = []
+        for output in preset.outputs:
+            recipe = ", ".join(
+                f"{channel.upper()}={self._source_chain_summary(source)}"
+                for channel, source in output.channels.items()
+            )
+            channel_lines.append(f"{output.label}: {recipe}")
+        self.preset_channels_label.setText("Channels:\n" + "\n".join(channel_lines))
+        self.preset_notes_label.setText("Import notes:\n" + "\n".join(preset.notes or ("No special notes.",)))
+
+    def _update_inspector_output_options(self) -> None:
+        if not hasattr(self, "inspector_output_combo"):
+            return
+        current = self.inspector_output_combo.currentData()
+        self.inspector_output_combo.blockSignals(True)
+        self.inspector_output_combo.clear()
+        for output in self._effective_preset().outputs:
+            self.inspector_output_combo.addItem(output.label, output.key)
+        index = self.inspector_output_combo.findData(current)
+        self.inspector_output_combo.setCurrentIndex(index if index >= 0 else 0)
+        self.inspector_output_combo.blockSignals(False)
+        self._refresh_inspector()
+
+    def _selected_inspector_output(self) -> OutputTexture | None:
+        if not hasattr(self, "inspector_output_combo"):
+            return None
+        key = self.inspector_output_combo.currentData()
+        for output in self._effective_preset().outputs:
+            if output.key == key:
+                return output
+        return None
+
+    def _refresh_inspector(self) -> None:
+        if not hasattr(self, "inspector_preview"):
+            return
+        material = self.current_material
+        output = self._selected_inspector_output()
+        if not material or not output:
+            self.inspector_material_label.setText("Material: none")
+            self.inspector_source_label.setText("Source: n/a")
+            self.inspector_warning_label.setText("Select or scan a material to preview channels.")
+            self.inspector_preview.setPixmap(QPixmap())
+            self.inspector_preview.setText("Select a material and channel")
+            return
+
+        self.inspector_material_label.setText(f"Material: {material.name}")
+        self.inspector_material_label.setToolTip(str(material.source_folder or ""))
+        channel = self.inspector_channel_combo.currentData()
+        valid_channels = set(output.channels)
+        if channel not in valid_channels:
+            channel = next(iter(output.channels))
+            index = self.inspector_channel_combo.findData(channel)
+            if index >= 0:
+                self.inspector_channel_combo.blockSignals(True)
+                self.inspector_channel_combo.setCurrentIndex(index)
+                self.inspector_channel_combo.blockSignals(False)
+
+        source = output.channels.get(channel)
+        if not source:
+            self.inspector_source_label.setText("Source: not used by this output.")
+            self.inspector_warning_label.setText("")
+            self.inspector_preview.setPixmap(QPixmap())
+            self.inspector_preview.setText("Channel not used")
+            return
+
+        self.inspector_source_label.setText(f"Source: {self._source_chain_summary(source)}")
+        try:
+            pixmap = self._render_channel_preview(material, source)
+        except Exception as exc:
+            self.inspector_warning_label.setText(str(exc))
+            self.inspector_preview.setPixmap(QPixmap())
+            self.inspector_preview.setText("Preview unavailable")
+            return
+        self.inspector_warning_label.setText("")
+        self.inspector_preview.setText("")
+        self.inspector_preview.setPixmap(
+            pixmap.scaled(
+                self.inspector_preview.size(),
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+        )
+
+    def _render_channel_preview(self, material: MaterialSet, source: ChannelSource) -> QPixmap:
+        size = self._preview_size(material)
+        image_cache = {}
+        warnings: list[str] = []
+        arr = resolve_channel(source, material, size, image_cache, warnings)
+        with BytesIO() as buffer:
+            Image.fromarray(arr, mode="L").save(buffer, format="PNG")
+            pixmap = QPixmap()
+            pixmap.loadFromData(buffer.getvalue(), "PNG")
+        if warnings:
+            self.inspector_warning_label.setText("\n".join(warnings))
+        return pixmap
+
+    def _preview_size(self, material: MaterialSet) -> tuple[int, int]:
+        for path in material.maps.values():
+            try:
+                with Image.open(path) as image:
+                    return image.size
+            except Exception:
+                continue
+        return (256, 256)
+
+    def _game_ready_profile(self, material: MaterialSet | None = None) -> dict:
+        if not hasattr(self, "compression_profile_combo") or not self.manifest_profile_check.isChecked():
+            return {}
+        key = self.compression_profile_combo.currentData()
+        profile = COMPRESSION_PROFILES.get(key, COMPRESSION_PROFILES["desktop_bc"])
+        target_material = material or self.current_material or MaterialSet("_empty")
+        return {
+            "profile": profile["name"],
+            "recommended_formats": profile["texture_formats"],
+            "notes": list(profile["notes"]),
+            "warnings": self._compression_warnings(target_material),
+        }
+
+    def _refresh_game_ready_panel(self) -> None:
+        if not hasattr(self, "compression_report"):
+            return
+        key = self.compression_profile_combo.currentData()
+        profile = COMPRESSION_PROFILES.get(key, COMPRESSION_PROFILES["desktop_bc"])
+        self.compression_report.setText(
+            f"Profile: {profile['name']}\n"
+            f"Recommended formats: {profile['texture_formats']}\n\n"
+            + "\n".join(profile["notes"])
+        )
+        material = self.current_material
+        warnings = self._compression_warnings(material) if material else ["Select a material to see texture readiness checks."]
+        self.compression_warnings.setText("Checks:\n" + "\n".join(warnings))
+
+    def _compression_warnings(self, material: MaterialSet | None) -> list[str]:
+        if not material:
+            return ["No material selected."]
+        warnings: list[str] = []
+        sizes = self._map_sizes(material)
+        if self.pot_warning_check.isChecked():
+            for key, size in sorted(sizes.items()):
+                if not self._is_power_of_two(size[0]) or not self._is_power_of_two(size[1]):
+                    label = MAP_TYPES.get(key).label.split(" / ", 1)[0] if key in MAP_TYPES else key
+                    warnings.append(f"{label}: {size[0]}x{size[1]} is not power-of-two.")
+        if len(set(sizes.values())) > 1:
+            warnings.append("Input maps use mixed resolutions; export will resize to the first priority texture.")
+        if "normal" in material.maps:
+            warnings.append("Normal maps usually compress best with BC5/normal-map engine settings.")
+        if "base_color" in material.maps:
+            warnings.append("Base color should stay sRGB; packed masks should stay linear.")
+        return warnings or ["No game-readiness issues detected."]
+
+    @staticmethod
+    def _is_power_of_two(value: int) -> bool:
+        return value > 0 and (value & (value - 1)) == 0
 
     def _preset_changed(self) -> None:
-        preset = self.preset
+        preset = self._effective_preset()
         self.sidebar_preset.setText(f"{preset.name}\n{preset.description}")
         if hasattr(self, "recipe_panel"):
             self.recipe_panel.set_preset(preset)
+        self._refresh_preset_details()
+        self._update_inspector_output_options()
+        self._refresh_game_ready_panel()
         self._rebuild_slots()
         if self.current_material:
             self._load_material_into_slots(self.current_material)
@@ -1033,8 +1607,9 @@ class MaterialTextureStudio(QMainWindow):
     def _rebuild_slots(self) -> None:
         clear_layout(self.slot_layout)
         self.slots.clear()
-        required = self._required_maps_for_preset(self.preset)
-        for info in ordered_map_types_for_preset(self.preset):
+        preset = self._effective_preset()
+        required = self._required_maps_for_preset(preset)
+        for info in ordered_map_types_for_preset(preset):
             slot = TextureSlotCard(info.key, info.key in required)
             slot.fileChanged.connect(self.on_slot_changed)
             self.slots[info.key] = slot
@@ -1163,7 +1738,7 @@ class MaterialTextureStudio(QMainWindow):
                 elif col == 4:
                     item.setToolTip(f"Output target:\n{value}" if value else "Choose a batch output folder")
                 elif col == 3:
-                    warnings = validate_material(material, self.preset)
+                    warnings = validate_material(material, self._effective_preset())
                     item.setToolTip("\n".join(warnings) if warnings else "Ready to export")
                 else:
                     item.setToolTip(value)
@@ -1219,10 +1794,11 @@ class MaterialTextureStudio(QMainWindow):
             try:
                 result = pack_material(
                     material,
-                    self.preset,
+                    self._effective_preset(),
                     self._batch_target_root(material),
                     overwrite=self.batch_overwrite_check.isChecked(),
                     folder_per_material=self.batch_folder_per_material_check.isChecked(),
+                    game_ready_profile=self._game_ready_profile(material),
                 )
                 completed += 1
                 output_paths.extend(result.output_paths)
@@ -1278,10 +1854,11 @@ class MaterialTextureStudio(QMainWindow):
             try:
                 result = pack_material(
                     material,
-                    self.preset,
+                    self._effective_preset(),
                     output_folder,
                     overwrite=overwrite,
                     folder_per_material=folder_per_material,
+                    game_ready_profile=self._game_ready_profile(material),
                 )
                 completed += 1
                 output_paths.extend(result.output_paths)
@@ -1433,7 +2010,7 @@ class MaterialTextureStudio(QMainWindow):
             self.health_resolution.setText("Resolution: no readable textures")
             self.health_resolution.setToolTip("")
 
-        required = self._required_maps_for_preset(self.preset)
+        required = self._required_maps_for_preset(self._effective_preset())
         missing = sorted(required - set(material.maps))
         if missing:
             names = [MAP_TYPES[key].label.split(" / ", 1)[0] for key in missing if key in MAP_TYPES]
@@ -1486,7 +2063,7 @@ class MaterialTextureStudio(QMainWindow):
 
     def _status_for_material(self, material: MaterialSet) -> str:
         missing = []
-        for warning in validate_material(material, self.preset):
+        for warning in validate_material(material, self._effective_preset()):
             if " needs " in warning:
                 missing.append(warning.split(" needs ", 1)[1].rstrip("."))
         if missing:
@@ -1520,6 +2097,36 @@ class MaterialTextureStudio(QMainWindow):
                 background: {PANEL_BG};
                 border: 1px solid {BORDER};
                 border-radius: {RADIUS}px;
+            }}
+
+            QTabWidget::pane {{
+                border: none;
+                background: transparent;
+                padding-top: 10px;
+            }}
+
+            QTabBar::tab {{
+                background: {PANEL_BG};
+                color: {TEXT_MUTED};
+                border: 1px solid {BORDER};
+                border-bottom-color: {BORDER};
+                border-top-left-radius: 8px;
+                border-top-right-radius: 8px;
+                min-width: 150px;
+                min-height: 34px;
+                padding: 4px 12px;
+                margin-right: 6px;
+            }}
+
+            QTabBar::tab:selected {{
+                background: #102B3A;
+                border-color: #1E7EA8;
+                color: {TEXT};
+            }}
+
+            QTabBar::tab:hover {{
+                background: #1B242E;
+                color: {TEXT};
             }}
 
             #ActionStrip {{
@@ -1693,6 +2300,14 @@ class MaterialTextureStudio(QMainWindow):
                 color: {TEXT_DIM};
                 font-size: 10px;
                 font-weight: 700;
+            }}
+
+            #InspectorPreview {{
+                background: {INPUT_BG};
+                border: 1px solid {BORDER};
+                border-radius: 8px;
+                color: {TEXT_DIM};
+                padding: 12px;
             }}
 
             #SlotTitle, #RecipeOutput {{

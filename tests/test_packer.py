@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+import json
 from pathlib import Path
 
 import numpy as np
@@ -82,6 +83,44 @@ class PackerTests(unittest.TestCase):
             mask_path = next(path for path in result.output_paths if path.name.endswith("_Mask.png"))
             arr = np.asarray(Image.open(mask_path).convert("RGBA"))
             self.assertEqual(tuple(arr[0, 0]), (0, 255, 0, 215))
+
+    def test_gltf_metallic_roughness_channel_order_and_manifest_profile(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            base = folder / "Bronze_BaseColor.png"
+            normal = folder / "Bronze_Normal.png"
+            rough = folder / "Bronze_Roughness.png"
+            metal = folder / "Bronze_Metallic.png"
+
+            write_rgb(base, (90, 70, 40))
+            write_rgb(normal, (128, 128, 255))
+            write_gray(rough, 80)
+            write_gray(metal, 220)
+
+            result = pack_material(
+                MaterialSet(
+                    name="Bronze",
+                    maps={
+                        "base_color": base,
+                        "normal": normal,
+                        "roughness": rough,
+                        "metallic": metal,
+                    },
+                ),
+                PRESETS["gltf_metallic_roughness"],
+                folder / "out",
+                game_ready_profile={
+                    "profile": "Web / KTX2 Basis",
+                    "recommended_formats": "KTX2/Basis Universal",
+                },
+            )
+
+            mr_path = next(path for path in result.output_paths if path.name.endswith("_MetallicRoughness.png"))
+            arr = np.asarray(Image.open(mr_path).convert("RGB"))
+            self.assertEqual(tuple(arr[0, 0]), (255, 80, 220))
+
+            manifest = json.loads((folder / "out" / "Bronze_manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["game_ready_profile"]["profile"], "Web / KTX2 Basis")
 
     def test_blender_style_aliases_are_detected(self):
         with tempfile.TemporaryDirectory() as tmp:

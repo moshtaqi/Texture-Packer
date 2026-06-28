@@ -157,6 +157,7 @@ def pack_material(
     *,
     overwrite: bool = True,
     folder_per_material: bool = False,
+    game_ready_profile: dict | None = None,
 ) -> PackResult:
     output_root = Path(output_folder)
     material_folder = output_root / safe_name(material.name) if folder_per_material else output_root
@@ -183,7 +184,7 @@ def pack_material(
         image.save(path, format="PNG", compress_level=4)
         output_paths.append(path)
 
-    write_manifest(material, preset, material_folder, output_paths, warnings)
+    write_manifest(material, preset, material_folder, output_paths, warnings, game_ready_profile=game_ready_profile)
     return PackResult(material_name=material.name, output_paths=output_paths, warnings=warnings)
 
 
@@ -193,6 +194,8 @@ def write_manifest(
     output_folder: Path,
     output_paths: list[Path],
     warnings: list[str],
+    *,
+    game_ready_profile: dict | None = None,
 ) -> None:
     payload = {
         "material": material.name,
@@ -204,6 +207,7 @@ def write_manifest(
         "inputs": {key: str(path) for key, path in sorted(material.maps.items())},
         "outputs": [str(path) for path in output_paths],
         "import_notes": list(preset.notes),
+        "game_ready_profile": game_ready_profile or {},
         "warnings": warnings,
     }
     manifest_path = output_folder / f"{safe_name(material.name)}_manifest.json"
