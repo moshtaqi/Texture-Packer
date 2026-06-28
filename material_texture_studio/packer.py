@@ -8,6 +8,12 @@ import numpy as np
 from PIL import Image
 
 from material_texture_studio.models import ChannelSource, MaterialSet, OutputTexture, PackResult, Preset
+from material_texture_studio.pipeline import (
+    PipelineOptions,
+    collect_pipeline_metadata,
+    output_stem,
+    target_size_with_options,
+)
 
 
 def safe_name(text: str, fallback: str = "Material") -> str:
@@ -158,7 +164,9 @@ def pack_material(
     overwrite: bool = True,
     folder_per_material: bool = False,
     game_ready_profile: dict | None = None,
+    pipeline_options: dict | PipelineOptions | None = None,
 ) -> PackResult:
+    options = pipeline_options if isinstance(pipeline_options, PipelineOptions) else PipelineOptions.from_dict(pipeline_options)
     output_root = Path(output_folder)
     material_folder = output_root / safe_name(material.name) if folder_per_material else output_root
     material_folder.mkdir(parents=True, exist_ok=True)
@@ -167,7 +175,7 @@ def pack_material(
     if any(" needs " in warning for warning in warnings):
         raise ValueError("\n".join(warnings))
 
-    size = _target_size(material, preset)
+    size = target_size_with_options(_target_size(material, preset), options)
     image_cache: dict[tuple[Path, str], np.ndarray] = {}
     output_paths: list[Path] = []
 
@@ -178,13 +186,23 @@ def pack_material(
             )
             continue
         image = _pack_output(output, material, size, image_cache, warnings)
-        path = material_folder / f"{safe_name(material.name)}{output.suffix}.png"
+        path = material_folder / f"{output_stem(material, output, options)}.png"
         if path.exists() and not overwrite:
             raise FileExistsError(f"Output already exists: {path}")
         image.save(path, format="PNG", compress_level=4)
         output_paths.append(path)
 
-    write_manifest(material, preset, material_folder, output_paths, warnings, game_ready_profile=game_ready_profile)
+    options.compression_profile = game_ready_profile or options.compression_profile
+    pipeline_metadata = collect_pipeline_metadata(material, preset, output_paths, warnings, options)
+    write_manifest(
+        material,
+        preset,
+        material_folder,
+        output_paths,
+        warnings,
+        game_ready_profile=game_ready_profile,
+        pipeline_metadata=pipeline_metadata,
+    )
     return PackResult(material_name=material.name, output_paths=output_paths, warnings=warnings)
 
 
@@ -196,6 +214,7 @@ def write_manifest(
     warnings: list[str],
     *,
     game_ready_profile: dict | None = None,
+    pipeline_metadata: dict | None = None,
 ) -> None:
     payload = {
         "material": material.name,
@@ -208,6 +227,7 @@ def write_manifest(
         "outputs": [str(path) for path in output_paths],
         "import_notes": list(preset.notes),
         "game_ready_profile": game_ready_profile or {},
+        "pipeline": pipeline_metadata or {},
         "warnings": warnings,
     }
     manifest_path = output_folder / f"{safe_name(material.name)}_manifest.json"

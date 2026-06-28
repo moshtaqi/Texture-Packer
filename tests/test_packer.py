@@ -122,6 +122,58 @@ class PackerTests(unittest.TestCase):
             manifest = json.loads((folder / "out" / "Bronze_manifest.json").read_text(encoding="utf-8"))
             self.assertEqual(manifest["game_ready_profile"]["profile"], "Web / KTX2 Basis")
 
+    def test_pipeline_options_resize_naming_and_sidecars(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            base = folder / "Panel_BaseColor.png"
+            normal = folder / "Panel_Normal.png"
+            rough = folder / "Panel_Roughness.png"
+
+            arr = np.zeros((12, 20, 3), dtype=np.uint8)
+            arr[:, :] = (40, 80, 120)
+            Image.fromarray(arr, mode="RGB").save(base)
+            write_rgb(normal, (128, 128, 255))
+            write_gray(rough, 50)
+
+            result = pack_material(
+                MaterialSet(
+                    name="Panel",
+                    maps={"base_color": base, "normal": normal, "roughness": rough},
+                    source_folder=folder,
+                ),
+                PRESETS["unreal_orm"],
+                folder / "out",
+                pipeline_options={
+                    "naming_profile": "custom",
+                    "naming_template": "TEX_{material}{suffix}",
+                    "max_size": 8,
+                    "force_power_of_two": True,
+                    "html_report": True,
+                    "csv_report": True,
+                    "usd_sidecar": True,
+                    "materialx_sidecar": True,
+                    "ktx2_mode": "plan",
+                    "import_targets": ["unreal"],
+                },
+            )
+
+            base_output = next(path for path in result.output_paths if path.name == "TEX_Panel_BaseColor.png")
+            with Image.open(base_output) as image:
+                self.assertLessEqual(max(image.size), 8)
+                self.assertTrue(all((value & (value - 1)) == 0 for value in image.size))
+
+            output_folder = folder / "out"
+            self.assertTrue((output_folder / "Panel_pipeline_report.html").exists())
+            self.assertTrue((output_folder / "Panel_pipeline_report.csv").exists())
+            self.assertTrue((output_folder / "Panel_usd_sidecar.json").exists())
+            self.assertTrue((output_folder / "Panel_materialx_sidecar.json").exists())
+            self.assertTrue((output_folder / "Panel_texture_transforms.json").exists())
+            self.assertTrue((output_folder / "Panel_unreal_import.py").exists())
+
+            manifest = json.loads((output_folder / "Panel_manifest.json").read_text(encoding="utf-8"))
+            self.assertIn("pipeline", manifest)
+            self.assertEqual(manifest["pipeline"]["options"]["naming_profile"], "custom")
+
     def test_blender_style_aliases_are_detected(self):
         with tempfile.TemporaryDirectory() as tmp:
             folder = Path(tmp)

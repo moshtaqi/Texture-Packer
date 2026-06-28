@@ -28,6 +28,7 @@ from PyQt6.QtWidgets import (
     QSizePolicy,
     QSplitter,
     QStackedWidget,
+    QSpinBox,
     QTableWidget,
     QTableWidgetItem,
     QTabWidget,
@@ -44,6 +45,7 @@ from material_texture_studio.detect import (
 )
 from material_texture_studio.models import ChannelSource, MaterialSet, OutputTexture, Preset
 from material_texture_studio.packer import pack_material, resolve_channel, validate_material
+from material_texture_studio.pipeline import IMPORT_TARGETS, NAMING_PROFILES, PipelineOptions, estimate_texture_memory
 from material_texture_studio.presets import MAP_TYPES, PRESETS, ordered_map_types_for_preset
 from material_texture_studio.preview import make_thumbnail
 
@@ -686,9 +688,10 @@ class MaterialTextureStudio(QMainWindow):
             self.pot_warning_check.setChecked(bool(options["pot_warning"]))
         if "manifest_profile" in options and hasattr(self, "manifest_profile_check"):
             self.manifest_profile_check.setChecked(bool(options["manifest_profile"]))
+        self._set_pipeline_options(data.get("pipeline_options", {}))
 
         mode = data.get("mode", 0)
-        self._set_page(int(mode) if mode in {0, 1, 2} else 0)
+        self._set_page(int(mode) if mode in {0, 1, 2, 3} else 0)
 
     def _save_settings(self) -> None:
         path = settings_path()
@@ -714,6 +717,7 @@ class MaterialTextureStudio(QMainWindow):
                 "manifest_profile": self.manifest_profile_check.isChecked(),
             },
             "custom_preset": self._custom_config_from_ui(),
+            "pipeline_options": self._pipeline_options_dict(),
         }
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -744,6 +748,7 @@ class MaterialTextureStudio(QMainWindow):
         self.pages.addWidget(self._build_single_page())
         self.pages.addWidget(self._build_batch_page())
         self.pages.addWidget(self._build_advanced_page())
+        self.pages.addWidget(self._build_pipeline_tab())
         body.addWidget(self.pages, 1)
         root.addLayout(body, 1)
 
@@ -794,13 +799,16 @@ class MaterialTextureStudio(QMainWindow):
         self.single_nav = NavButton("Single Material")
         self.batch_nav = NavButton("Batch Conversion")
         self.advanced_nav = NavButton("Advanced Tools")
+        self.pipeline_nav = NavButton("Pipeline Tools")
         self.single_nav.clicked.connect(lambda: self._set_page(0))
         self.batch_nav.clicked.connect(lambda: self._set_page(1))
         self.advanced_nav.clicked.connect(lambda: self._set_page(2))
+        self.pipeline_nav.clicked.connect(lambda: self._set_page(3))
         self.single_nav.setChecked(True)
         layout.addWidget(self.single_nav)
         layout.addWidget(self.batch_nav)
         layout.addWidget(self.advanced_nav)
+        layout.addWidget(self.pipeline_nav)
         layout.addSpacing(10)
 
         layout.addWidget(make_label("Current Preset", "TinyHeader"))
@@ -1296,11 +1304,286 @@ class MaterialTextureStudio(QMainWindow):
         root.addWidget(report, 1)
         return page
 
+    def _build_pipeline_tab(self) -> QWidget:
+        page = QWidget()
+        root = QVBoxLayout(page)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(12)
+
+        hero = Panel("PipelineHero")
+        hero_layout = QHBoxLayout(hero)
+        hero_layout.setContentsMargins(16, 14, 16, 14)
+        hero_layout.setSpacing(14)
+        copy = QVBoxLayout()
+        copy.setContentsMargins(0, 0, 0, 0)
+        copy.setSpacing(4)
+        copy.addWidget(make_label("Pipeline Tools", "PanelTitle"))
+        subtitle = make_label(
+            "Production handoff controls for naming, resizing, reports, import helpers, UDIM metadata, and sidecars.",
+            "AppSubtitle",
+        )
+        subtitle.setWordWrap(True)
+        copy.addWidget(subtitle)
+        hero_layout.addLayout(copy, 1)
+        self.pipeline_payload_pill = Pill("Reports + sidecars", "accent")
+        hero_layout.addWidget(self.pipeline_payload_pill, alignment=Qt.AlignmentFlag.AlignVCenter)
+        root.addWidget(hero)
+
+        tabs = QTabWidget()
+        tabs.setObjectName("PipelineSubTabs")
+        tabs.addTab(self._build_pipeline_naming_tab(), "Naming && Size")
+        tabs.addTab(self._build_pipeline_automation_tab(), "Automation")
+        tabs.addTab(self._build_pipeline_qa_tab(), "QA Reports")
+        tabs.addTab(self._build_pipeline_udim_tab(), "UDIM && Atlas")
+        tabs.addTab(self._build_pipeline_sidecar_tab(), "Sidecars")
+        root.addWidget(tabs)
+        return page
+
+    def _build_pipeline_naming_tab(self) -> QWidget:
+        page = QWidget()
+        root = QHBoxLayout(page)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(12)
+
+        naming = Panel("Panel")
+        layout = QVBoxLayout(naming)
+        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setSpacing(12)
+        layout.addWidget(make_label("Naming Profiles", "PanelTitle"))
+        self.naming_profile_combo = QComboBox()
+        for key, profile in NAMING_PROFILES.items():
+            self.naming_profile_combo.addItem(profile["name"], key)
+        self.naming_profile_combo.currentIndexChanged.connect(self._pipeline_options_changed)
+        layout.addWidget(make_label("Profile", "FieldLabel"))
+        layout.addWidget(self.naming_profile_combo)
+        self.naming_template_edit = QLineEdit("{material}{suffix}")
+        self.naming_template_edit.setObjectName("PathEdit")
+        self.naming_template_edit.setToolTip("Tokens: {material}, {suffix}, {output}. Used when Custom Template is selected.")
+        self.naming_template_edit.textChanged.connect(self._refresh_pipeline_panel)
+        layout.addWidget(make_label("Custom Template", "FieldLabel"))
+        layout.addWidget(self.naming_template_edit)
+        self.naming_example_label = make_label("Example: Rock_ORM.png", "HealthText")
+        self.naming_example_label.setWordWrap(True)
+        layout.addWidget(self.naming_example_label)
+        layout.addStretch(1)
+        root.addWidget(naming, 1)
+
+        processing = Panel("Panel")
+        processing_layout = QVBoxLayout(processing)
+        processing_layout.setContentsMargins(14, 14, 14, 14)
+        processing_layout.setSpacing(12)
+        processing_layout.addWidget(make_label("Resize & Budget", "PanelTitle"))
+        self.max_size_combo = QComboBox()
+        for label, value in (("Keep source size", 0), ("512", 512), ("1K", 1024), ("2K", 2048), ("4K", 4096), ("8K", 8192)):
+            self.max_size_combo.addItem(label, value)
+        self.max_size_combo.currentIndexChanged.connect(self._pipeline_options_changed)
+        processing_layout.addWidget(make_label("Max Output Size", "FieldLabel"))
+        processing_layout.addWidget(self.max_size_combo)
+        self.force_pot_check = TickCheckBox("Force power-of-two")
+        self.force_pot_check.setToolTip("Resize output dimensions to the nearest power of two after max-size clamping.")
+        self.force_pot_check.stateChanged.connect(self._pipeline_options_changed)
+        self.mipmap_metadata_check = TickCheckBox("Write mipmap metadata")
+        self.mipmap_metadata_check.setChecked(True)
+        self.mipmap_metadata_check.setToolTip("Include mipmap intent and memory estimates in pipeline reports.")
+        self.mipmap_metadata_check.stateChanged.connect(self._pipeline_options_changed)
+        processing_layout.addWidget(self.force_pot_check)
+        processing_layout.addWidget(self.mipmap_metadata_check)
+        processing_layout.addWidget(make_label("Memory Budget MB", "FieldLabel"))
+        self.memory_budget_spin = QSpinBox()
+        self.memory_budget_spin.setRange(16, 8192)
+        self.memory_budget_spin.setValue(256)
+        self.memory_budget_spin.valueChanged.connect(self._refresh_pipeline_panel)
+        processing_layout.addWidget(self.memory_budget_spin)
+        self.memory_estimate_label = make_label("Select a material to estimate texture memory.", "HealthText")
+        self.memory_estimate_label.setWordWrap(True)
+        processing_layout.addWidget(self.memory_estimate_label)
+        processing_layout.addStretch(1)
+        root.addWidget(processing, 1)
+        return page
+
+    def _build_pipeline_automation_tab(self) -> QWidget:
+        page = QWidget()
+        root = QHBoxLayout(page)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(12)
+
+        scripts = Panel("Panel")
+        layout = QVBoxLayout(scripts)
+        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setSpacing(12)
+        layout.addWidget(make_label("Engine Import Helpers", "PanelTitle"))
+        self.import_target_checks: dict[str, TickCheckBox] = {}
+        for key, label in IMPORT_TARGETS.items():
+            check = TickCheckBox(label)
+            check.setChecked(key in {"unreal", "unity"})
+            check.setToolTip(f"Write a {label} helper beside the exported textures.")
+            check.stateChanged.connect(self._pipeline_options_changed)
+            self.import_target_checks[key] = check
+            layout.addWidget(check)
+        layout.addStretch(1)
+        root.addWidget(scripts, 1)
+
+        ktx = Panel("Panel")
+        ktx_layout = QVBoxLayout(ktx)
+        ktx_layout.setContentsMargins(14, 14, 14, 14)
+        ktx_layout.setSpacing(12)
+        ktx_layout.addWidget(make_label("KTX2 / Basis", "PanelTitle"))
+        note = make_label("Write command plans by default; run conversion automatically when basisu or toktx is available.", "HealthText")
+        note.setWordWrap(True)
+        ktx_layout.addWidget(note)
+        self.ktx2_mode_combo = QComboBox()
+        self.ktx2_mode_combo.addItem("Off", "off")
+        self.ktx2_mode_combo.addItem("Write command plan", "plan")
+        self.ktx2_mode_combo.addItem("Run if tool exists", "run")
+        self.ktx2_mode_combo.setCurrentIndex(1)
+        self.ktx2_mode_combo.currentIndexChanged.connect(self._pipeline_options_changed)
+        ktx_layout.addWidget(make_label("Mode", "FieldLabel"))
+        ktx_layout.addWidget(self.ktx2_mode_combo)
+        self.ktx2_tool_edit = QLineEdit()
+        self.ktx2_tool_edit.setObjectName("PathEdit")
+        self.ktx2_tool_edit.setPlaceholderText("Optional path to basisu.exe or toktx.exe")
+        self.ktx2_tool_edit.textChanged.connect(self._refresh_pipeline_panel)
+        browse = QPushButton("Browse Tool")
+        browse.setObjectName("SecondaryButton")
+        browse.clicked.connect(self._choose_ktx2_tool)
+        ktx_layout.addWidget(make_label("Tool Path", "FieldLabel"))
+        ktx_layout.addWidget(self.ktx2_tool_edit)
+        ktx_layout.addWidget(browse, alignment=Qt.AlignmentFlag.AlignRight)
+        ktx_layout.addStretch(1)
+        root.addWidget(ktx, 1)
+        return page
+
+    def _build_pipeline_qa_tab(self) -> QWidget:
+        page = QWidget()
+        root = QHBoxLayout(page)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(12)
+
+        color = Panel("Panel")
+        layout = QVBoxLayout(color)
+        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setSpacing(12)
+        layout.addWidget(make_label("Color & OCIO Audit", "PanelTitle"))
+        self.color_audit_check = TickCheckBox("Write color-space audit")
+        self.color_audit_check.setChecked(True)
+        self.color_audit_check.setToolTip("Flag sRGB color textures versus linear data maps in reports and sidecars.")
+        self.color_audit_check.stateChanged.connect(self._pipeline_options_changed)
+        layout.addWidget(self.color_audit_check)
+        self.ocio_config_edit = QLineEdit()
+        self.ocio_config_edit.setObjectName("PathEdit")
+        self.ocio_config_edit.setPlaceholderText("Optional OCIO config path")
+        self.ocio_config_edit.textChanged.connect(self._refresh_pipeline_panel)
+        browse = QPushButton("Browse Config")
+        browse.setObjectName("SecondaryButton")
+        browse.clicked.connect(self._choose_ocio_config)
+        layout.addWidget(make_label("OCIO Config", "FieldLabel"))
+        layout.addWidget(self.ocio_config_edit)
+        layout.addWidget(browse, alignment=Qt.AlignmentFlag.AlignRight)
+        layout.addStretch(1)
+        root.addWidget(color, 1)
+
+        reports = Panel("Panel")
+        report_layout = QVBoxLayout(reports)
+        report_layout.setContentsMargins(14, 14, 14, 14)
+        report_layout.setSpacing(12)
+        report_layout.addWidget(make_label("Pipeline Reports", "PanelTitle"))
+        self.html_report_check = TickCheckBox("HTML report")
+        self.html_report_check.setChecked(True)
+        self.csv_report_check = TickCheckBox("CSV report")
+        self.csv_report_check.setChecked(True)
+        for check in (self.html_report_check, self.csv_report_check):
+            check.setToolTip("Write a review-friendly material QA report beside the export.")
+            check.stateChanged.connect(self._pipeline_options_changed)
+            report_layout.addWidget(check)
+        self.pipeline_summary_label = make_label("", "HealthText")
+        self.pipeline_summary_label.setWordWrap(True)
+        report_layout.addWidget(self.pipeline_summary_label)
+        report_layout.addStretch(1)
+        root.addWidget(reports, 1)
+        return page
+
+    def _build_pipeline_udim_tab(self) -> QWidget:
+        page = QWidget()
+        root = QHBoxLayout(page)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(12)
+
+        panel = Panel("Panel")
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setSpacing(12)
+        layout.addWidget(make_label("UDIM / Virtual Texture", "PanelTitle"))
+        self.udim_detect_check = TickCheckBox("Detect UDIM tiles")
+        self.udim_detect_check.setChecked(True)
+        self.udim_detect_check.setToolTip("Scan source folder for 1001/1002 style tiles and write tile metadata.")
+        self.udim_detect_check.stateChanged.connect(self._pipeline_options_changed)
+        layout.addWidget(self.udim_detect_check)
+        self.udim_summary_label = make_label("Select a material to inspect UDIM tiles.", "HealthText")
+        self.udim_summary_label.setWordWrap(True)
+        layout.addWidget(self.udim_summary_label)
+        layout.addStretch(1)
+        root.addWidget(panel, 1)
+
+        atlas = Panel("Panel")
+        atlas_layout = QVBoxLayout(atlas)
+        atlas_layout.setContentsMargins(14, 14, 14, 14)
+        atlas_layout.setSpacing(12)
+        atlas_layout.addWidget(make_label("Atlas / Texture Transform", "PanelTitle"))
+        self.atlas_preview_check = TickCheckBox("Write atlas preview")
+        self.atlas_preview_check.setToolTip("Create a compact contact-sheet preview of assigned source maps.")
+        self.texture_transform_check = TickCheckBox("Write texture transform metadata")
+        self.texture_transform_check.setChecked(True)
+        self.texture_transform_check.setToolTip("Write KHR_texture_transform style offset/scale metadata for downstream tools.")
+        for check in (self.atlas_preview_check, self.texture_transform_check):
+            check.stateChanged.connect(self._pipeline_options_changed)
+            atlas_layout.addWidget(check)
+        atlas_layout.addStretch(1)
+        root.addWidget(atlas, 1)
+        return page
+
+    def _build_pipeline_sidecar_tab(self) -> QWidget:
+        page = QWidget()
+        root = QHBoxLayout(page)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(12)
+
+        sidecars = Panel("Panel")
+        layout = QVBoxLayout(sidecars)
+        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setSpacing(12)
+        layout.addWidget(make_label("Studio Sidecars", "PanelTitle"))
+        self.usd_sidecar_check = TickCheckBox("OpenUSD sidecar JSON")
+        self.usd_sidecar_check.setChecked(True)
+        self.materialx_sidecar_check = TickCheckBox("MaterialX sidecar JSON")
+        self.materialx_sidecar_check.setChecked(True)
+        for check in (self.usd_sidecar_check, self.materialx_sidecar_check):
+            check.setToolTip("Write structured metadata for larger studio asset pipelines.")
+            check.stateChanged.connect(self._pipeline_options_changed)
+            layout.addWidget(check)
+        sidecar_note = make_label("These sidecars are lightweight handoff metadata, not full USD or MaterialX documents.", "HealthText")
+        sidecar_note.setWordWrap(True)
+        layout.addWidget(sidecar_note)
+        layout.addStretch(1)
+        root.addWidget(sidecars, 1)
+
+        overview = Panel("Panel")
+        overview_layout = QVBoxLayout(overview)
+        overview_layout.setContentsMargins(14, 14, 14, 14)
+        overview_layout.setSpacing(12)
+        overview_layout.addWidget(make_label("Export Payload", "PanelTitle"))
+        self.pipeline_payload_label = make_label("", "HealthText")
+        self.pipeline_payload_label.setWordWrap(True)
+        overview_layout.addWidget(self.pipeline_payload_label)
+        overview_layout.addStretch(1)
+        root.addWidget(overview, 1)
+        return page
+
     def _set_page(self, index: int) -> None:
         self.pages.setCurrentIndex(index)
         self.single_nav.setChecked(index == 0)
         self.batch_nav.setChecked(index == 1)
         self.advanced_nav.setChecked(index == 2)
+        self.pipeline_nav.setChecked(index == 3)
 
     def _advanced_options_changed(self) -> None:
         self._rebuild_slots()
@@ -1310,7 +1593,155 @@ class MaterialTextureStudio(QMainWindow):
         self._refresh_preset_details()
         self._update_inspector_output_options()
         self._refresh_game_ready_panel()
+        self._refresh_pipeline_panel()
         self._refresh_actions()
+
+    def _pipeline_options_changed(self) -> None:
+        self._refresh_pipeline_panel()
+
+    def _choose_ktx2_tool(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Choose basisu or toktx executable",
+            str(Path.home()),
+            "Executables (*.exe);;All files (*)",
+        )
+        if path:
+            self.ktx2_tool_edit.setText(path)
+
+    def _choose_ocio_config(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Choose OCIO config",
+            str(Path.home()),
+            "OCIO config (*.ocio);;All files (*)",
+        )
+        if path:
+            self.ocio_config_edit.setText(path)
+
+    def _pipeline_options_dict(self) -> dict:
+        if not hasattr(self, "naming_profile_combo"):
+            return PipelineOptions().to_dict()
+        import_targets = [
+            key for key, check in self.import_target_checks.items()
+            if check.isChecked()
+        ]
+        return {
+            "naming_profile": self.naming_profile_combo.currentData(),
+            "naming_template": self.naming_template_edit.text().strip() or "{material}{suffix}",
+            "max_size": self.max_size_combo.currentData(),
+            "force_power_of_two": self.force_pot_check.isChecked(),
+            "generate_mipmap_metadata": self.mipmap_metadata_check.isChecked(),
+            "import_targets": import_targets,
+            "ocio_config": self.ocio_config_edit.text().strip(),
+            "color_audit": self.color_audit_check.isChecked(),
+            "detect_udim": self.udim_detect_check.isChecked(),
+            "atlas_preview": self.atlas_preview_check.isChecked(),
+            "texture_transform_metadata": self.texture_transform_check.isChecked(),
+            "html_report": self.html_report_check.isChecked(),
+            "csv_report": self.csv_report_check.isChecked(),
+            "usd_sidecar": self.usd_sidecar_check.isChecked(),
+            "materialx_sidecar": self.materialx_sidecar_check.isChecked(),
+            "ktx2_mode": self.ktx2_mode_combo.currentData(),
+            "ktx2_tool_path": self.ktx2_tool_edit.text().strip(),
+            "memory_budget_mb": self.memory_budget_spin.value(),
+            "compression_profile": self._game_ready_profile(self.current_material),
+        }
+
+    def _set_pipeline_options(self, data: dict) -> None:
+        if not data or not hasattr(self, "naming_profile_combo"):
+            return
+        combo_map = {
+            self.naming_profile_combo: data.get("naming_profile"),
+            self.max_size_combo: data.get("max_size"),
+            self.ktx2_mode_combo: data.get("ktx2_mode"),
+        }
+        for combo, value in combo_map.items():
+            index = combo.findData(value)
+            if index >= 0:
+                combo.setCurrentIndex(index)
+        if data.get("naming_template"):
+            self.naming_template_edit.setText(str(data["naming_template"]))
+        self.force_pot_check.setChecked(bool(data.get("force_power_of_two", False)))
+        self.mipmap_metadata_check.setChecked(bool(data.get("generate_mipmap_metadata", True)))
+        self.memory_budget_spin.setValue(int(data.get("memory_budget_mb") or 256))
+        for key, check in self.import_target_checks.items():
+            check.setChecked(key in set(data.get("import_targets", [])))
+        self.ktx2_tool_edit.setText(str(data.get("ktx2_tool_path", "")))
+        self.ocio_config_edit.setText(str(data.get("ocio_config", "")))
+        self.color_audit_check.setChecked(bool(data.get("color_audit", True)))
+        self.udim_detect_check.setChecked(bool(data.get("detect_udim", True)))
+        self.atlas_preview_check.setChecked(bool(data.get("atlas_preview", False)))
+        self.texture_transform_check.setChecked(bool(data.get("texture_transform_metadata", True)))
+        self.html_report_check.setChecked(bool(data.get("html_report", True)))
+        self.csv_report_check.setChecked(bool(data.get("csv_report", True)))
+        self.usd_sidecar_check.setChecked(bool(data.get("usd_sidecar", True)))
+        self.materialx_sidecar_check.setChecked(bool(data.get("materialx_sidecar", True)))
+        self._refresh_pipeline_panel()
+
+    def _refresh_pipeline_panel(self) -> None:
+        if not hasattr(self, "pipeline_payload_label"):
+            return
+        profile_key = self.naming_profile_combo.currentData()
+        profile = NAMING_PROFILES.get(profile_key, NAMING_PROFILES["default"])
+        template = self.naming_template_edit.text().strip() if profile_key == "custom" else profile["template"]
+        try:
+            example = template.format(material="Rock", suffix="_ORM", output="ORM", engine="Unreal")
+        except Exception:
+            example = profile["example"]
+        self.naming_example_label.setText(f"Example: {example}.png")
+
+        material = self.current_material
+        if material:
+            sizes = self._map_sizes(material)
+            if sizes:
+                width, height = next(iter(sizes.values()))
+                memory = estimate_texture_memory(width, height, "RGBA")
+                self.memory_estimate_label.setText(
+                    f"Current material estimate: {width}x{height}, "
+                    f"{memory['uncompressed_mb']} MB uncompressed with mipmaps, "
+                    f"{memory['bc7_mb']} MB BC7."
+                )
+            else:
+                self.memory_estimate_label.setText("No readable textures for memory estimate.")
+            udim_count = self._udim_tile_count(material)
+            self.udim_summary_label.setText(
+                f"UDIM tiles detected in source folder: {udim_count}" if udim_count else "No UDIM tiles detected in the current source folder."
+            )
+        else:
+            self.memory_estimate_label.setText("Select a material to estimate texture memory.")
+            self.udim_summary_label.setText("Select a material to inspect UDIM tiles.")
+
+        payload = []
+        if self.html_report_check.isChecked():
+            payload.append("HTML report")
+        if self.csv_report_check.isChecked():
+            payload.append("CSV report")
+        if self.usd_sidecar_check.isChecked():
+            payload.append("USD sidecar")
+        if self.materialx_sidecar_check.isChecked():
+            payload.append("MaterialX sidecar")
+        if self.atlas_preview_check.isChecked():
+            payload.append("atlas preview")
+        if self.ktx2_mode_combo.currentData() != "off":
+            payload.append("KTX2 command plan")
+        if hasattr(self, "pipeline_payload_pill"):
+            self.pipeline_payload_pill.setText(f"{len(payload)} output aids" if payload else "Lean export")
+            self.pipeline_payload_pill.set_tone("accent" if payload else "neutral")
+        self.pipeline_payload_label.setText("Will write: " + compact_list(payload, 8) if payload else "No pipeline sidecars selected.")
+        self.pipeline_summary_label.setText(
+            f"Reports include color audit: {'yes' if self.color_audit_check.isChecked() else 'no'}\n"
+            f"OCIO config: {self.ocio_config_edit.text().strip() or 'not set'}"
+        )
+
+    def _udim_tile_count(self, material: MaterialSet) -> int:
+        if not material.source_folder:
+            return 0
+        count = 0
+        for path in material.source_folder.glob("*"):
+            if path.is_file() and any(f"1{index:03d}" in path.stem for index in range(1, 100)):
+                count += 1
+        return count
 
     def _effective_preset(self) -> Preset:
         preset = self.preset
@@ -1597,6 +2028,7 @@ class MaterialTextureStudio(QMainWindow):
         self._refresh_preset_details()
         self._update_inspector_output_options()
         self._refresh_game_ready_panel()
+        self._refresh_pipeline_panel()
         self._rebuild_slots()
         if self.current_material:
             self._load_material_into_slots(self.current_material)
@@ -1684,6 +2116,7 @@ class MaterialTextureStudio(QMainWindow):
             self._loading_slots = False
         self._refresh_slot_warning()
         self._refresh_health_panel()
+        self._refresh_pipeline_panel()
 
     def on_slot_changed(self, map_type: str, path_text: str) -> None:
         if self._loading_slots or not self.current_material:
@@ -1694,6 +2127,7 @@ class MaterialTextureStudio(QMainWindow):
             self.current_material.maps.pop(map_type, None)
         self._refresh_slot_warning()
         self._refresh_health_panel()
+        self._refresh_pipeline_panel()
         self._refresh_actions()
 
     def clear_slots(self, *, emit: bool = True) -> None:
@@ -1704,6 +2138,7 @@ class MaterialTextureStudio(QMainWindow):
                 self.current_material.maps.pop(map_type, None)
         self._refresh_slot_warning()
         self._refresh_health_panel()
+        self._refresh_pipeline_panel()
         self._refresh_actions()
 
     def scan_batch_folder(self) -> None:
@@ -1799,6 +2234,7 @@ class MaterialTextureStudio(QMainWindow):
                     overwrite=self.batch_overwrite_check.isChecked(),
                     folder_per_material=self.batch_folder_per_material_check.isChecked(),
                     game_ready_profile=self._game_ready_profile(material),
+                    pipeline_options=self._pipeline_options_dict(),
                 )
                 completed += 1
                 output_paths.extend(result.output_paths)
@@ -1859,6 +2295,7 @@ class MaterialTextureStudio(QMainWindow):
                     overwrite=overwrite,
                     folder_per_material=folder_per_material,
                     game_ready_profile=self._game_ready_profile(material),
+                    pipeline_options=self._pipeline_options_dict(),
                 )
                 completed += 1
                 output_paths.extend(result.output_paths)
@@ -2093,7 +2530,7 @@ class MaterialTextureStudio(QMainWindow):
                 font-size: 13px;
             }}
 
-            #Header, #Sidebar, #Panel, #StatusPanel, #RecipePanel {{
+            #Header, #Sidebar, #Panel, #StatusPanel, #RecipePanel, #PipelineHero {{
                 background: {PANEL_BG};
                 border: 1px solid {BORDER};
                 border-radius: {RADIUS}px;
@@ -2127,6 +2564,24 @@ class MaterialTextureStudio(QMainWindow):
             QTabBar::tab:hover {{
                 background: #1B242E;
                 color: {TEXT};
+            }}
+
+            #PipelineSubTabs::pane {{
+                border: none;
+                padding-top: 10px;
+            }}
+
+            #PipelineSubTabs QTabBar::tab {{
+                min-width: 132px;
+                min-height: 32px;
+                border-radius: 8px;
+                margin-right: 6px;
+                background: #121922;
+            }}
+
+            #PipelineSubTabs QTabBar::tab:selected {{
+                background: #102B3A;
+                border-color: #1E7EA8;
             }}
 
             #ActionStrip {{
@@ -2170,7 +2625,7 @@ class MaterialTextureStudio(QMainWindow):
                 text-transform: uppercase;
             }}
 
-            #PathEdit, QLineEdit, QComboBox {{
+            #PathEdit, QLineEdit, QComboBox, QSpinBox {{
                 background: {INPUT_BG};
                 border: 1px solid {BORDER};
                 border-radius: 8px;
@@ -2183,6 +2638,12 @@ class MaterialTextureStudio(QMainWindow):
             QComboBox::drop-down {{
                 border: none;
                 width: 28px;
+            }}
+
+            QSpinBox::up-button, QSpinBox::down-button {{
+                background: {ELEVATED_BG};
+                border: none;
+                width: 18px;
             }}
 
             QPushButton {{
